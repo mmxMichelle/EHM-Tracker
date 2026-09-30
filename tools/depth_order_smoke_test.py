@@ -73,6 +73,19 @@ def load_mano_pkl(path):
     return out
 
 
+def np_to_torch(v):
+    """dtype-aware numpy -> torch: floating -> float32; (unsigned) integer / bool -> int64 (never cast to float).
+    torch < 2.4 cannot build tensors from np.uint32 (e.g. MANO faces 'f'), so ints go through int64 explicitly."""
+    a = np.asarray(v)
+    if np.issubdtype(a.dtype, np.floating):
+        return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))
+    if np.issubdtype(a.dtype, np.integer) or a.dtype == np.bool_:
+        if np.issubdtype(a.dtype, np.unsignedinteger) and a.size and a.max() > np.iinfo(np.int64).max:
+            raise ValueError('unsigned array does not fit in int64')
+        return torch.from_numpy(np.ascontiguousarray(a, dtype=np.int64))
+    raise TypeError(f'unsupported dtype for tensor conversion: {a.dtype}')
+
+
 class _Obj:
     pass
 
@@ -188,7 +201,7 @@ def run_synthetic(out_dir, mano_dir):
     src = DepthSource(vda[None], frame_map={key: 0}, space='body_hd')
 
     # differentiable tracker: B = R_B * LBS(pose_B) + t_B, perspective projection
-    th = {k: torch.tensor(v, dtype=torch.float32) for k, v in m.items() if k != 'kintree_table'}
+    th = {k: np_to_torch(v) for k, v in m.items() if k != 'kintree_table'}
     parents = torch.tensor(m['kintree_table'][0].astype(np.int64)); parents[0] = -1
     posedirs = th['posedirs'].reshape(-1, th['posedirs'].shape[-1]).T
     RB_t = torch.tensor(RB, dtype=torch.float32)
