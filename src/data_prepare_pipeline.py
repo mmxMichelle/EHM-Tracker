@@ -48,7 +48,8 @@ class DataPreparePipeline(object):
         self.flame_opt = FlameOptimizer(self.cfg.flame_assets_dir, device=self.device, image_size=self.cfg.head_crop_size,tanfov=self.cfg.tanfov)
         self.ehm_opt   = EhmOptimizer(self.cfg.flame_assets_dir, self.cfg.smplx_assets_dir, self.cfg.mano_assets_dir, 
                                         device=self.device, body_image_size=self.cfg.body_hd_size, head_image_size=self.cfg.head_crop_size,tanfov=self.cfg.tanfov,
-                                        vposer_ckpt=self.cfg.vposer_ckpt_dir)
+                                        vposer_ckpt=self.cfg.vposer_ckpt_dir,
+                                        depth_order_cfg=self._build_depth_order_cfg())
         
         self.flame = self.flame_opt.flame
         self.ehm_opt.ehm.flame = self.flame                      
@@ -56,6 +57,17 @@ class DataPreparePipeline(object):
         self.ehm = self.ehm_opt.ehm
         self.head_renderer = self.flame_opt.renderer
         self.body_renderer = self.ehm_opt.body_renderer
+
+    def _build_depth_order_cfg(self):
+        # [depth-ordering] None unless explicitly enabled => baseline EhmOptimizer
+        if not getattr(self.cfg, 'enable_depth_ordering', False):
+            return None
+        from .modules.depth_ordering import DepthOrderConfig
+        return DepthOrderConfig(enable=True, lambda_depth_order=self.cfg.lambda_depth_order,
+                                margin=self.cfg.depth_pair_margin,
+                                interaction_2d_threshold=self.cfg.interaction_2d_threshold,
+                                refresh_every=self.cfg.depth_refresh_every,
+                                hand_pose_lr=self.cfg.depth_hand_pose_lr, debug_vis=self.cfg.depth_debug_vis)
 
     def get_video_name(self, video_fp, using_last_k=1):
         aa_names  = []
@@ -248,6 +260,7 @@ class DataPreparePipeline(object):
                     lmdb_engine = LMDBEngine(out_lmdb_dir, write=True)
                     base_results = {}
                     id_share_params_results = {}
+                    frame_index_map = {}  # [depth-ordering] tracker key -> source video frame index
                     with torch.no_grad():
                         last_results = None
                         img_idx = 0
@@ -276,6 +289,7 @@ class DataPreparePipeline(object):
                             del ret_results['flame_coeffs']['shape_params'] 
                             del ret_results['smplx_coeffs']['shape']
                             base_results[b_name] = ret_results
+                            frame_index_map[b_name] = int(idx)
                             
                             for k, v in shape_results.items():
                                 if k not in id_share_params_results: id_share_params_results[k] = []
@@ -295,6 +309,10 @@ class DataPreparePipeline(object):
                     lmdb_engine.random_visualize(os.path.join(out_lmdb_dir, 'visualize.jpg'))
                     lmdb_engine.close()
                     write_dict_pkl(base_track_fp, base_results)
+                    if self.cfg.enable_depth_ordering:  # [depth-ordering] only written when enabled
+                        with open(os.path.join(saving_root, 'frame_index_map.json'), 'w') as f:
+                            json.dump({'frames': frame_index_map, 'image_size': list(img_rgb.shape[:2]),
+                                       'frame_interval': frame_interval}, f)
                     log(f'Prepare OK: ...{video_fp[-20:]} ==> {saving_root}')
                 else:
                     base_results = load_dict_pkl(base_track_fp)
@@ -340,7 +358,11 @@ class DataPreparePipeline(object):
                     if self.cfg.fit_ehm:
                         self.ehm_opt.saving_root=saving_root
                         log(f"[{video_idx:04d}/{len(args.source_dir)}] Refining ehm-smplx parameters: {video_name}")
-                        opt_smplx_coeff,id_share_params_results = self.ehm_opt.run(optimized_result,id_share_params_results,lmdb_engine,frame_interval)
+                        depth_kw = {}
+                        if self.cfg.enable_depth_ordering:  # [depth-ordering] precomputed VDA maps
+                            from .modules.depth_ordering import load_depth_source_for_video
+                            depth_kw['depth_source'] = load_depth_source_for_video(self.cfg, video_name, saving_root, log=log)
+                        opt_smplx_coeff,id_share_params_results = self.ehm_opt.run(optimized_result,id_share_params_results,lmdb_engine,frame_interval, **depth_kw)
                         for key in base_results.keys():
                             optimized_result[key]['smplx_coeffs'] = opt_smplx_coeff[key]
                             del optimized_result[key]['left_mano_coeffs']['betas']

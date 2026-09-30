@@ -1,6 +1,6 @@
 import os.path as osp
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 from .base_config import PrintableConfig
 
 @dataclass(repr=False)  # use repr from PrintableConfig
@@ -54,4 +54,17 @@ class DataPreparationConfig(PrintableConfig):
     check_hand_score: float = 0.7
     check_hand_dist:  float = body_hd_size*3
     not_check_hand: bool = False
+
+    # ---- [depth-ordering] experimental; defaults keep the baseline unchanged ----
+    enable_depth_ordering: bool = False
+    vda_depth_root: str = ''              # file, or dir with <video_name>.npy|.npz|_depths.npz
+    vda_frame_map: str = ''               # json (or dir of <video_name>.json); default <saving_root>/frame_index_map.json
+    vda_depth_space: str = 'original'     # 'original' (video frame pixels) | 'body_hd' (1024 crop pixels)
+    vda_larger_is_closer: bool = True
+    lambda_depth_order: float = 100.0
+    depth_pair_margin: float = 0.01
+    interaction_2d_threshold: float = 12.0
+    depth_refresh_every: int = 100
+    depth_hand_pose_lr: Optional[float] = None   # e.g. 1e-5 / 5e-5 / 1e-4; None keeps baseline 1e-5
+    depth_debug_vis: bool = True
     

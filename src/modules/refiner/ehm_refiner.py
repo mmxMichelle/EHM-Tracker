@@ -64,7 +64,7 @@ def load_vposer(expr_dir, vp_model='snapshot'):
 class EhmOptimizer(object):
     def __init__(self, flame_assets_dir, smplx_assets_dir, mano_assets_dir, 
                  device='cuda:0', body_image_size=1024, head_image_size=512, 
-                 tanfov=1.0/12, vposer_ckpt='', bbone_cfg_fp=''):
+                 tanfov=1.0/12, vposer_ckpt='', bbone_cfg_fp='', depth_order_cfg=None):
         """
         Optimize the body pose and shape parameters using two stage optimization.
         Stage 1: Optimize the body pose and shape parameters for better head & hand alignment.
@@ -99,6 +99,8 @@ class EhmOptimizer(object):
         self.check_pose = True
         self.kps_map, kps_w = smplx_to_dwpose()
         self.kps_w = torch.from_numpy(kps_w).unsqueeze(0).to(self.device)
+        # [depth-ordering] optional DepthOrderConfig; None/disabled => baseline behaviour
+        self.depth_order_cfg = depth_order_cfg
 
     def transform_points3d(self, points3d:torch.Tensor, M:torch.Tensor):
         R3d = torch.zeros_like(M)
@@ -173,7 +175,7 @@ class EhmOptimizer(object):
         p[..., 2] = -p[..., 2]
         return p
     
-    def optimize(self, track_frames, batch_base,id_share_parms, batch_id=0, steps=1001, share_id=True,batch_imgs=None,interval=1):
+    def optimize(self, track_frames, batch_base,id_share_parms, batch_id=0, steps=1001, share_id=True,batch_imgs=None,interval=1, depth_ctx=None):
         batch_size = len(track_frames)
 
         batch_smplx, batch_flame, gt_lmk_2d = batch_base['smplx_coeffs'], batch_base['flame_coeffs'], batch_base['dwpose_rlt']
@@ -267,6 +269,8 @@ class EhmOptimizer(object):
             {"params":[head_scale],"lr":1e-4*_lr_decay},
             {"params":[hand_scale],"lr":1e-4*_lr_decay},
         ])
+        if depth_ctx is not None:  # [depth-ordering] optional hand-pose lr override (only when enabled)
+            depth_ctx.attach_optimizer(opt_p, batch_smplx['left_hand_pose'], batch_smplx['right_hand_pose'])
 
         t_bar = tqdm(range(steps), desc='Start tuning SMPLX global params [Warmup]')
         for i_step in t_bar:
@@ -345,13 +349,24 @@ class EhmOptimizer(object):
             mtn_reg_loss += self.metric(proj_vertices[1:], proj_vertices[:-1])*1/(interval*1)
             total_loss = loss_3d + loss_2d + loss_prior + mtn_reg_loss
 
+            if depth_ctx is not None:  # [depth-ordering] local VDA-guided ordinal loss (baseline terms untouched)
+                loss_depth_order, depth_stats = depth_ctx.step(
+                    i_step, steps, proj_vertices, batch_id=batch_id,
+                    loss_terms={'loss_3d_z': loss_3d_z, 'loss_3d_hand_l': loss_3d_hand_l, 'loss_3d_hand_r': loss_3d_hand_r},
+                    hand_poses=(batch_smplx['left_hand_pose'], batch_smplx['right_hand_pose']))
+                total_loss = total_loss + depth_ctx.cfg.lambda_depth_order * loss_depth_order
+
             loss_line = f'total: {total_loss:.2f} | 3d: {loss_3d:.2f} | 2d: {loss_2d:.2f} | prior: {loss_prior:.2f} | mtn_reg: {mtn_reg_loss:.2f} '
+            if depth_ctx is not None:
+                loss_line += depth_ctx.format_log(depth_stats)
             loss_info = f'Batch: {batch_id:02d} | Iter: {i_step:03d} >> Loss: {loss_line}'
             t_bar.set_description(loss_info)
 
             opt_p.zero_grad()
             total_loss.backward()
             opt_p.step()
+            if depth_ctx is not None:
+                depth_ctx.maybe_visualize(i_step, steps, batch_imgs, batch_id)
             
             if batch_imgs is not None and i_step%(steps-1)==0:
                 with torch.no_grad():
@@ -385,6 +400,8 @@ class EhmOptimizer(object):
                         cv2.imwrite(os.path.join(save_path,f"vis_fit_smplx_bid-{batch_id}_stp-{i_step}_{im_idx}.png"), cv2.cvtColor(_img.copy(), cv2.COLOR_RGB2BGR))
                         del _img
         
+        if depth_ctx is not None:
+            depth_ctx.finalize(batch_id)
         batch_smplx['camera_RT_params'].requires_grad=False
         batch_smplx['camera_RT_params'][:, :3, 3]=gl_T.detach()
         # batch_smplx['camera_RT_params'][:, :3, :3]=gl_R.detach()
@@ -414,7 +431,7 @@ class EhmOptimizer(object):
 
         return optim_smplx_results,id_share_parms
         
-    def run(self, tracked_rlt,id_share_rlt,lmdb_engine=None,interval=1,steps=1001):
+    def run(self, tracked_rlt,id_share_rlt,lmdb_engine=None,interval=1,steps=1001, depth_source=None):
         mini_batchs = build_minibatch(list(tracked_rlt.keys()), share_id=True)
         optim_results = {}
         id_share_rlt['head_scale']=np.array([[1.0,1.0,1.0]],dtype=np.float32)
@@ -425,13 +442,29 @@ class EhmOptimizer(object):
             mini_batch_flame_lmk = [tracked_rlt[key] for key in mini_batch]
             mini_batch_flame_lmk = torch.utils.data.default_collate(mini_batch_flame_lmk)
             mini_batch_flame_lmk = data_to_device(mini_batch_flame_lmk, device=self.device)
+            depth_kw = {}
+            if depth_source is not None and self.depth_order_cfg is not None and self.depth_order_cfg.enable:
+                depth_kw['depth_ctx'] = self.build_depth_ctx(mini_batch, mini_batch_flame_lmk, depth_source, lmdb_engine)
             optim_result,id_share_rlt = self.optimize(
                 mini_batch, mini_batch_flame_lmk,id_share_rlt, share_id=True, batch_id=batch_id, steps=steps,
-                batch_imgs=mini_batch_body_imgs,interval=interval
+                batch_imgs=mini_batch_body_imgs,interval=interval, **depth_kw
             )
             
             optim_results.update(optim_result)
         return optim_results,id_share_rlt
+
+    def build_depth_ctx(self, mini_batch, batch_base, depth_source, lmdb_engine=None):
+        """[depth-ordering] Build the per-mini-batch context (lazy import; unused by the baseline)."""
+        from ..depth_ordering.ehm_hook import DepthOrderContext
+        body_masks = None
+        if lmdb_engine is not None:
+            try:
+                body_masks = [lmdb_engine[f'{key}/body_mask'] for key in mini_batch]
+            except Exception as e:
+                log(f'depth-order: could not read body masks ({e}); proceeding without matting mask')
+        return DepthOrderContext(self.depth_order_cfg, depth_source, mini_batch, self.ehm,
+                                 M_c2o_hd=batch_base['body_crop'].get('M_c2o-hd'), body_masks=body_masks,
+                                 image_size=self.body_image_size, save_root=getattr(self, 'saving_root', None), log=log)
 
 
 def data_to_device(data_dict, device='cuda'):
