@@ -184,8 +184,27 @@ def lbs(betas, pose, v_template, shapedirs, posedirs, J_regressor, parents,
             The joints of the model
     '''
 
-    batch_size = max(betas.shape[0], pose.shape[0])
+    beta_batch = betas.shape[0]
+    pose_batch = pose.shape[0]
+
+    # Generic singleton-batch broadcasting.
+    # EHM may provide shared identity/shape parameters with B=1
+    # while pose contains one entry per frame. Support arbitrary N,
+    # rather than assuming a particular number of frames.
+    if beta_batch == 1 and pose_batch > 1:
+        betas = betas.expand(pose_batch, -1)
+    elif pose_batch == 1 and beta_batch > 1:
+        pose = pose.expand(beta_batch, -1, -1)
+
+    if betas.shape[0] != pose.shape[0]:
+        raise ValueError(
+            f"Batch mismatch in LBS: betas={betas.shape[0]}, "
+            f"pose={pose.shape[0]}"
+        )
+
+    batch_size = pose.shape[0]
     device = betas.device
+
     # import pdb
     # pdb.set_trace()
     # Add shape contribution

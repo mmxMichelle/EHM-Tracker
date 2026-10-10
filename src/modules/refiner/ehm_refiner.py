@@ -236,18 +236,50 @@ class EhmOptimizer(object):
 
         # optimizer related
         g_smplx_shape.requires_grad,left_hand_shape.requires_grad,right_hand_shape.requires_grad = True,True,True
-        batch_smplx['body_pose'].requires_grad = True
-        batch_smplx['camera_RT_params'].requires_grad = True
-        batch_smplx['global_pose'].requires_grad = True
-        batch_smplx['left_hand_pose'].requires_grad = True
-        batch_smplx['right_hand_pose'].requires_grad = True
-        gl_T = batch_smplx['camera_RT_params'][:, :3, 3].detach().clone()
-        gl_R = batch_smplx['camera_RT_params'][:, :3, :3].detach().clone()
-        gl_R_6d = matrix_to_rotation_6d(gl_R).detach().clone()
-        
-        gl_T[:,2]=(gl_T[:,2].mean(dim=0)[None].expand(batch_size,-1).detach().clone())[:,0]
-        gl_T.requires_grad,gl_R.requires_grad = True,True
-        gl_R_6d.requires_grad=True
+        # Make every optimized SMPL-X tensor an independent leaf.
+        # This prevents an autograd graph from a previous optimization
+        # iteration from being reused accidentally.
+        batch_smplx['body_pose'] = (
+            batch_smplx['body_pose'].detach().clone().requires_grad_(True)
+        )
+        batch_smplx['camera_RT_params'] = (
+            batch_smplx['camera_RT_params'].detach().clone().requires_grad_(True)
+        )
+        batch_smplx['global_pose'] = (
+            batch_smplx['global_pose'].detach().clone().requires_grad_(True)
+        )
+        batch_smplx['left_hand_pose'] = (
+            batch_smplx['left_hand_pose'].detach().clone().requires_grad_(True)
+        )
+        batch_smplx['right_hand_pose'] = (
+            batch_smplx['right_hand_pose'].detach().clone().requires_grad_(True)
+        )
+        # Build camera optimisation variables as independent leaf tensors.
+        # Perform the shared-depth initialisation BEFORE enabling gradients,
+        # because gl_T[:, 2] is modified below.
+        gl_T = (
+            batch_smplx['camera_RT_params'][:, :3, 3]
+            .detach().clone()
+        )
+        gl_R = (
+            batch_smplx['camera_RT_params'][:, :3, :3]
+            .detach().clone()
+        )
+
+        gl_T[:, 2] = (
+            gl_T[:, 2].mean(dim=0)[None]
+            .expand(batch_size, -1)
+        )[:, 0]
+
+        gl_T = gl_T.requires_grad_(True)
+        gl_R = gl_R.requires_grad_(True)
+
+        # 6D rotation is also an independent optimisation leaf.
+        gl_R_6d = (
+            matrix_to_rotation_6d(gl_R)
+            .detach().clone()
+            .requires_grad_(True)
+        )
         joints_offset.requires_grad=True
         g_flame_shape.requires_grad=True
         head_scale.requires_grad = True
@@ -283,9 +315,14 @@ class EhmOptimizer(object):
             batch_flame['shape_params']=g_flame_shape.expand(batch_size, -1)
             
             if self.use_vposer:
-                body_embedding_mean = self.vposer.encode(batch_smplx['body_pose']).mean
+                body_embedding_mean = self.vposer.encode(
+                    batch_smplx['body_pose']
+                ).mean
             else:
-                body_embedding_mean  = 0
+                # Keep this as a Tensor on the correct device/dtype.
+                # The zero is connected to the current batch, so this remains
+                # valid for any batch size N (1, 8, 70, 100, 150, ...).
+                body_embedding_mean = batch_smplx['body_pose'].sum() * 0.0
             smplx_dict = self.ehm(batch_smplx, batch_flame,pose_type='aa',)
             T=gl_T
             R=rotation_6d_to_matrix(gl_R_6d)
@@ -368,7 +405,7 @@ class EhmOptimizer(object):
             if depth_ctx is not None:
                 depth_ctx.maybe_visualize(i_step, steps, batch_imgs, batch_id)
             
-            if batch_imgs is not None and i_step%(steps-1)==0:
+            if batch_imgs is not None and (steps <= 1 or i_step % (steps - 1) == 0):
                 with torch.no_grad():
                     n_imgs = len(batch_imgs)
                     lights=PointLights(device=self.device, location=[[0.0, -1.0, -10.0]])

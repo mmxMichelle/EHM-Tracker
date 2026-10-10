@@ -1,0 +1,20 @@
+
+# External resources and runtime artefacts
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
+*.onnx
+*.safetensors
+*.mp4
+*.avi
+*.mov
+*.out
+*.err
+results/
+outputs/
+pretrained/

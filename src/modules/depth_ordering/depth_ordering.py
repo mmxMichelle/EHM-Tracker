@@ -65,7 +65,7 @@ class DepthOrderConfig:
     hand_pose_lr: Optional[float] = None   # override for left/right_hand_pose lr ONLY when enabled (e.g. 1e-5, 5e-5, 1e-4)
     debug_vis: bool = True
     max_vis_frames: int = 6
-    grad_diag: bool = True
+    grad_diag: bool = False
     log_every: int = 50
     max_canvas_cells: int = 640
 
